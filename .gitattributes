@@ -1,0 +1,6 @@
+# 这个包的 cmd/* 脚本和 manifest 最终跑在 Linux（fnOS）上，
+# 必须保持 LF，否则 Windows 上 clone 下来会带着 \r 导致脚本无法执行。
+* text=auto eol=lf
+*.png binary
+*.ico binary
+*.fpk binary

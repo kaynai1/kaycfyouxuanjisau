@@ -1,0 +1,105 @@
+#!/bin/bash
+# 启动 / 停止 / 状态
+# 原生 Python 运行，不依赖 Docker。
+#
+# 不用 set -u：fnOS 各版本的 TRIM_ 变量可能有增减，
+# 未定义就崩溃会让用户只看到"启动失败"却查不到原因。
+
+TRIM_APPDEST="${TRIM_APPDEST:-/var/apps/cfopt/target}"
+TRIM_PKGVAR="${TRIM_PKGVAR:-/var/apps/cfopt/var}"
+TRIM_TEMP_LOGFILE="${TRIM_TEMP_LOGFILE:-/tmp/cfopt-main.log}"
+TRIM_SERVICE_PORT="${TRIM_SERVICE_PORT:-8080}"
+
+PIDFILE="${TRIM_PKGVAR}/cfopt.pid"
+LOGFILE="${TRIM_PKGVAR}/cfopt.log"
+# fnpack 会把 app/ 的内容直接铺到 target 根目录，所以这里是 target/src
+APP_DIR="${TRIM_APPDEST}"
+
+# fnOS 的 python312 运行时
+PY_BIN="/var/apps/python312/target/bin"
+if [ -x "${PY_BIN}/python3" ]; then
+    PY="${PY_BIN}/python3"
+    export PATH="${PY_BIN}:$PATH"
+else
+    PY="$(command -v python3 || command -v python || true)"
+fi
+
+is_running() {
+    [ -f "$PIDFILE" ] || return 1
+    local pid
+    pid="$(cat "$PIDFILE" 2>/dev/null)"
+    [ -n "$pid" ] || return 1
+    kill -0 "$pid" 2>/dev/null
+}
+
+case "${1:-}" in
+start)
+    mkdir -p "$TRIM_PKGVAR" 2>/dev/null || true
+
+    if [ -z "$PY" ]; then
+        echo "未找到 Python 运行时，请确认已安装 python312 依赖。" > "$TRIM_TEMP_LOGFILE"
+        exit 1
+    fi
+
+    if is_running; then
+        exit 0
+    fi
+
+    # 清掉上次残留的 pid
+    rm -f "$PIDFILE"
+
+    cd "$APP_DIR" || {
+        echo "应用目录不存在：$APP_DIR" > "$TRIM_TEMP_LOGFILE"
+        exit 1
+    }
+
+    # 后台启动，日志留在应用数据目录
+    PYTHONPATH="${APP_DIR}/src" \
+    PYTHONUNBUFFERED=1 \
+    TARGET_HOST="" \
+    MODE="hosts" \
+    SYSTEM_HOSTS="/etc/hosts" \
+    DATA_DIR="${TRIM_PKGVAR}" \
+    HTTP_PORT="$TRIM_SERVICE_PORT" \
+    WORKERS="120" \
+    TIMEOUT="3" \
+    INTERVAL="21600" \
+    FAIL_FAST="1" \
+    nohup "$PY" -m cfopt.main >> "$LOGFILE" 2>&1 &
+
+    echo $! > "$PIDFILE"
+    sleep 2
+
+    if is_running; then
+        exit 0
+    fi
+
+    echo "启动失败，请查看日志：$LOGFILE" > "$TRIM_TEMP_LOGFILE"
+    tail -20 "$LOGFILE" 2>/dev/null > "$TRIM_TEMP_LOGFILE"
+    exit 1
+    ;;
+stop)
+    if is_running; then
+        pid="$(cat "$PIDFILE" 2>/dev/null)"
+        kill "$pid" 2>/dev/null || true
+        # 给 5 秒优雅退出，再强制
+        for _ in 1 2 3 4 5; do
+            is_running || break
+            sleep 1
+        done
+        is_running && kill -9 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null || true
+    fi
+    rm -f "$PIDFILE"
+    exit 0
+    ;;
+status)
+    if is_running; then
+        exit 0
+    fi
+    exit 3
+    ;;
+*)
+    echo "Unknown command: ${1:-}" > "$TRIM_TEMP_LOGFILE"
+    exit 1
+    ;;
+esac

@@ -1,0 +1,26 @@
+#!/bin/bash
+# 卸载前：停进程，清理 hosts 里写入的区块
+# 不用 set -u，理由同 main。
+
+TRIM_PKGVAR="${TRIM_PKGVAR:-/var/apps/cfopt/var}"
+PIDFILE="${TRIM_PKGVAR}/cfopt.pid"
+
+# 1. 停掉后台进程
+if [ -f "$PIDFILE" ]; then
+    pid="$(cat "$PIDFILE" 2>/dev/null)"
+    if [ -n "$pid" ]; then
+        kill "$pid" 2>/dev/null || true
+        sleep 1
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$PIDFILE"
+fi
+
+# 2. 清理 /etc/hosts 中本应用写入的区块（只删自己的）
+if [ -f /etc/hosts ] && grep -q '>>> cfopt-managed >>>' /etc/hosts 2>/dev/null; then
+    cp -f /etc/hosts /etc/hosts.cfopt.bak 2>/dev/null || true
+    sed -i '/# >>> cfopt-managed >>>/,/# <<< cfopt-managed <<</d' /etc/hosts 2>/dev/null || true
+    echo "已清理 /etc/hosts 中的优选记录（备份在 /etc/hosts.cfopt.bak）"
+fi
+
+exit 0

@@ -1,0 +1,8 @@
+#!/bin/bash
+# 升级后重启服务，让新代码立即生效，并触发失败域名的重扫。
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+"$DIR/main" stop >/dev/null 2>&1 || true
+"$DIR/main" start >/dev/null 2>&1 || true
+
+exit 0

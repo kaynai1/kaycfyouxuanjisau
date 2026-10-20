@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+app.tgz
+*.tmp
+.DS_Store
+cfopt1.fpk
+cfopt2.fpk

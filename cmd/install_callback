@@ -1,0 +1,33 @@
+#!/bin/bash
+# 安装后：准备运行环境
+# 原生 Python 应用，不需要 Docker 镜像，这里只做目录和权限准备。
+
+TRIM_APPDEST="${TRIM_APPDEST:-/var/apps/cfopt/target}"
+TRIM_PKGVAR="${TRIM_PKGVAR:-/var/apps/cfopt/var}"
+TRIM_TEMP_LOGFILE="${TRIM_TEMP_LOGFILE:-/tmp/cfopt-install.log}"
+
+# 数据目录（域名配置、扫描结果）
+mkdir -p "$TRIM_PKGVAR" 2>/dev/null || {
+    echo "无法创建数据目录：$TRIM_PKGVAR" > "$TRIM_TEMP_LOGFILE"
+    exit 1
+}
+
+# 检查 Python 运行时
+PY_BIN="/var/apps/python312/target/bin"
+if [ -x "${PY_BIN}/python3" ]; then
+    echo "Python 运行时就绪：$("${PY_BIN}/python3" --version 2>&1)"
+elif command -v python3 >/dev/null 2>&1; then
+    echo "使用系统 Python：$(python3 --version 2>&1)"
+else
+    echo "未找到 Python 运行时，请确认 python312 依赖已安装。" > "$TRIM_TEMP_LOGFILE"
+    exit 1
+fi
+
+# 校验包内源码完整（fnpack 把 app/ 内容铺到 target 根，所以是 target/src）
+if [ ! -f "${TRIM_APPDEST}/src/cfopt/main.py" ]; then
+    echo "应用文件不完整，缺少 src/cfopt/main.py。" > "$TRIM_TEMP_LOGFILE"
+    exit 1
+fi
+
+echo "安装完成"
+exit 0
