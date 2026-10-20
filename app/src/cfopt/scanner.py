@@ -9,7 +9,8 @@ import time
 import traceback
 
 from .probe import (CF_V4, expand_ranges, fetch_v2too_ips,
-                    nets_from_results, scan)
+                    nets_from_results, scan, scan_tunnel_edges,
+                    tunnel_candidates)
 
 
 class Scanner:
@@ -260,7 +261,59 @@ class Scanner:
                                      daemon=True).start()
                     # 错开一点，避免瞬间打出几百个并发
                     time.sleep(0.5)
+            t = self.store.tunnel
+            if t.enabled and now - t.last_scan_at >= t.interval:
+                threading.Thread(target=self.scan_tunnel, daemon=True).start()
             self._stop.wait(30)
+
+    # ---------------------------------------------------------- 隧道边缘扫描
+    TUNNEL_KEY = "__tunnel__"
+
+    def scan_tunnel(self):
+        """扫描 Cloudflare Tunnel 专用边缘段（198.41.192/200.0/24:7844）。
+
+        连接器只认这两段，跟优选域名是两套节点，所以单独扫。
+        失败保留上一次结果；扫描期间 DNS 继续用旧边缘，隧道不会中断。
+        """
+        t = self.store.tunnel
+        with self._lock:
+            if self._running.get(self.TUNNEL_KEY):
+                self.log("[tunnel] 已有扫描在进行，跳过")
+                return
+            self._running[self.TUNNEL_KEY] = True
+        try:
+            if not self._slots.acquire(blocking=False):
+                self.log("[tunnel] 等待其他扫描完成")
+                self._slots.acquire()
+            try:
+                t.set_progress(0, len(tunnel_candidates()), 0)
+                self.log("[tunnel] 开始扫描隧道边缘段")
+                head, alive = scan_tunnel_edges(
+                    workers=min(64, self.workers), timeout=self.timeout,
+                    progress=lambda done, total, a: t.set_progress(done, total, a))
+                t.clear_progress()
+                if not head:
+                    t.mark_failed("隧道边缘段全部不可达")
+                    self.log("[tunnel] 扫描无结果，沿用上一次边缘")
+                    return
+                t.apply_scan(head, alive)
+                self.log(f"[tunnel] 存活 {alive} 个，采用 " + ", ".join(
+                    f"{e['ip']}({e['colo']} {e['connect_ms']:.0f}ms)"
+                    for e in head[: t.top_n * 2]))
+            finally:
+                self._slots.release()
+        except Exception:
+            err = traceback.format_exc(limit=2)
+            t.mark_failed(err)
+            self.log(f"[tunnel] 扫描异常：{err}")
+        finally:
+            with self._lock:
+                self._running.pop(self.TUNNEL_KEY, None)
+            self.store.save()
+
+    def trigger_tunnel(self):
+        """手动触发隧道边缘扫描，立即返回。"""
+        threading.Thread(target=self.scan_tunnel, daemon=True).start()
 
     def trigger(self, domain):
         """手动触发，立即返回。"""

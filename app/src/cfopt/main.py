@@ -19,7 +19,8 @@ import traceback
 
 from . import __version__, web
 from .dnssrv import DnsServer
-from .probe import CF_V4, expand_ranges, nets_from_results, scan
+from .probe import (CF_V4, TUNNEL_REGIONS, expand_ranges, nets_from_results,
+                    scan)
 from .scanner import Scanner
 from .store import DomainStore
 
@@ -43,6 +44,10 @@ class Config:
         self.top_n = int(os.environ.get("TOP_N", "3"))
         self.timeout = float(os.environ.get("TIMEOUT", "3"))
         self.dns_listen = os.environ.get("DNS_LISTEN", "0.0.0.0:53")
+        # 隧道加速专用 DNS：只服务 cloudflared，单独占一个非特权端口，
+        # 不碰 NAS 系统 DNS，关掉开关也不会影响本机其它解析。
+        self.tunnel_dns_listen = os.environ.get("TUNNEL_DNS_LISTEN",
+                                                "0.0.0.0:15353")
         self.upstreams = self._parse_upstreams(
             os.environ.get("UPSTREAMS", "223.5.5.5:53,119.29.29.29:53"))
         self.data_dir = os.environ.get("DATA_DIR", "/data")
@@ -220,6 +225,28 @@ def main():
             if cfg.fail_fast:
                 return 1
 
+    # ---------------------------------------------------------- 隧道加速 DNS
+    # 与主 DNS 独立：MODE=hosts 时也要能用，因为 cloudflared 是自己指定
+    # 解析器（TUNNEL_DNS_RESOLVER_ADDRS），不依赖系统 DNS。
+    # 端口被占只告警不退出：隧道加速属于增强功能，不该拖累域名优选。
+    thost, tport = cfg.tunnel_dns_listen.rsplit(":", 1)
+    cfg.tunnel_dns_port = int(tport)
+    tunnel_dns = DnsServer(
+        listen_host=thost,
+        listen_port=int(tport),
+        upstreams=cfg.upstreams,
+        match_domains=list(TUNNEL_REGIONS),
+        get_ips=_make_tunnel_resolver(store),
+        log=log,
+    )
+    tunnel_dns.start()
+    if tunnel_dns.ok:
+        log(f"Tunnel 加速 DNS：{thost}:{tport}"
+            f"（{'已开启' if store.tunnel.enabled else '未开启'}）")
+    else:
+        log(f"Tunnel 加速 DNS 启动失败：{tunnel_dns.udp_error or '绑定超时'}，"
+            f"可用 TUNNEL_DNS_LISTEN=0.0.0.0:<其他端口> 更换")
+
     # ---------------------------------------------------------- 扫描循环
     def hosts_sig():
         """当前应写进 hosts 的内容签名，增删改启停都会让它变化。"""
@@ -262,7 +289,7 @@ def main():
         write_hosts_all(cfg, store.list())
 
     # ---------------------------------------------------------- Web 服务
-    httpd = web.serve(cfg, store, scanner)
+    httpd = web.serve(cfg, store, scanner, tunnel_dns=tunnel_dns)
     log(f"管理界面 http://0.0.0.0:{cfg.http_port}/")
 
     try:
@@ -273,6 +300,7 @@ def main():
         scanner.stop()
         if dns:
             dns.stop()
+        tunnel_dns.stop()
     return 0
 
 
@@ -296,6 +324,25 @@ def _make_resolver(store):
             if qname.endswith("." + d.host):
                 return d.get_ips()
         return []
+
+    return resolve
+
+
+def _make_tunnel_resolver(store):
+    """隧道加速的解析回调：只回答 region1/region2.v2.argotunnel.com。
+
+    没有优选结果（未开启、还没扫、结果过期）时返回空列表，
+    DnsServer 自动转发上游，连接器拿到 Cloudflare 的原始答案 ——
+    最坏情况只是没提速，不会让隧道连不上。
+    """
+    def resolve(qname=None):
+        pins = store.tunnel.pins()
+        if qname is None:
+            out = []
+            for ips in pins.values():
+                out.extend(ips)
+            return out
+        return list(pins.get(qname.rstrip(".").lower(), []))
 
     return resolve
 

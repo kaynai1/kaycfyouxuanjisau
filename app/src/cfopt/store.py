@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def _new_id():
@@ -214,6 +214,145 @@ class Domain:
             }
 
 
+class TunnelState:
+    """Cloudflare Tunnel 连接器边缘优选的全局状态。
+
+    隧道连接器不按域名走，它只连 Cloudflare 自己的边缘段
+    （region1/region2.v2.argotunnel.com:7844）。所以这里是一份全局配置，
+    所有隧道共用。
+    """
+
+    # 结果放太久就不再接管解析，交回上游 DNS：
+    # 宁可隧道没有优化，也不能让连接器一直用一批 Cloudflare 已经撤掉的边缘 IP，
+    # 那会直接把隧道连不上。
+    MAX_AGE = 3 * 86400
+
+    def __init__(self, enabled=False, interval=21600, top_n=2, **kw):
+        self.enabled = bool(enabled)
+        self.interval = int(interval)
+        self.top_n = max(1, int(top_n))
+        # 优选边缘明细：[{ip, colo, connect_ms}, ...]，已按延迟排序
+        self.edges = kw.get("edges") or []
+        self.total_alive = kw.get("total_alive") or 0
+        self.last_scan_at = kw.get("last_scan_at") or 0
+        self.last_scan_ok = kw.get("last_scan_ok", False)
+        self.last_error = kw.get("last_error", "")
+        self.progress = None
+        # 可重入：snapshot() 持锁时还要读 progress_snapshot()
+        self._lock = threading.RLock()
+        self._store = None
+
+    @classmethod
+    def from_dict(cls, d):
+        d = d or {}
+        return cls(
+            enabled=d.get("enabled", False),
+            interval=d.get("interval", 21600),
+            top_n=d.get("top_n", 2),
+            **{k: d[k] for k in ("edges", "total_alive", "last_scan_at",
+                                 "last_scan_ok", "last_error") if k in d}
+        )
+
+    def to_dict(self):
+        with self._lock:
+            return {k: getattr(self, k) for k in
+                    ("enabled", "interval", "top_n", "edges", "total_alive",
+                     "last_scan_at", "last_scan_ok", "last_error")}
+
+    # ---------------------------------------------------------- 进度
+    def set_progress(self, done, total, alive):
+        with self._lock:
+            if self.progress is None:
+                self.progress = {"started": int(time.time())}
+            self.progress.update(done=done, total=total, alive=alive)
+
+    def clear_progress(self):
+        with self._lock:
+            self.progress = None
+
+    def progress_snapshot(self):
+        with self._lock:
+            if not self.progress:
+                return None
+            p = dict(self.progress)
+            total = p.get("total") or 0
+            p["pct"] = int(p.get("done", 0) / total * 100) if total else 0
+            p["elapsed"] = int(time.time() - p.get("started", time.time()))
+            return p
+
+    # ---------------------------------------------------------- 扫描结果
+    def apply_scan(self, edges, total_alive):
+        with self._lock:
+            self.edges = edges[:40]
+            self.total_alive = total_alive
+            self.last_scan_at = int(time.time())
+            self.last_scan_ok = bool(edges)
+            self.last_error = "" if edges else "隧道边缘段全部不可达"
+        self._persist()
+
+    def mark_failed(self, err):
+        # 故意保留上一次的 edges：扫描偶发失败不该让隧道退回慢边缘
+        with self._lock:
+            self.last_scan_ok = False
+            self.last_error = err
+            self.last_scan_at = int(time.time())
+        self._persist()
+
+    def _persist(self):
+        store = self._store
+        if store is not None:
+            try:
+                store.save()
+            except Exception:
+                pass
+
+    def update(self, **fields):
+        if "top_n" in fields and fields["top_n"] is not None:
+            self.top_n = max(1, int(fields["top_n"]))
+        if "interval" in fields and fields["interval"] is not None:
+            self.interval = int(fields["interval"])
+        if "enabled" in fields and fields["enabled"] is not None:
+            self.enabled = bool(fields["enabled"])
+
+    def pins(self):
+        """返回 {域名: [ip, ...]}，交给 DNS 层钉住连接器。
+
+        region1 拿最快的一批，region2 拿次快的一批：两个都返回同一组 IP
+        等于没有备份，主边缘出问题时候连接器无处可退。
+        结果过期或没扫出来时返回空 —— DNS 层会自动转发上游，隧道照常工作。
+        """
+        with self._lock:
+            if not self.enabled or not self.edges:
+                return {}
+            if time.time() - self.last_scan_at > self.MAX_AGE:
+                return {}
+            n = self.top_n
+            ordered = [e["ip"] for e in self.edges if e.get("ip")]
+            if not ordered:
+                return {}
+            primary = ordered[:n]
+            backup = ordered[n:2 * n] or ordered[-n:]
+            return {"region1.v2.argotunnel.com": primary,
+                    "region2.v2.argotunnel.com": backup}
+
+    def snapshot(self):
+        with self._lock:
+            prog = self.progress_snapshot()
+            return {
+                "enabled": self.enabled,
+                "interval": self.interval,
+                "top_n": self.top_n,
+                "edges": [dict(e) for e in self.edges],
+                "total_alive": self.total_alive,
+                "last_scan_at": self.last_scan_at,
+                "last_scan_ok": self.last_scan_ok,
+                "last_error": self.last_error,
+                "stale": bool(self.enabled and self.edges and
+                              time.time() - self.last_scan_at > self.MAX_AGE),
+                "progress": prog,
+            }
+
+
 class DomainStore:
     """域名的增删改查 + 落盘。线程安全。"""
 
@@ -222,6 +361,8 @@ class DomainStore:
         self.log = log
         self._lock = threading.RLock()
         self._domains = []
+        self.tunnel = TunnelState()
+        self.tunnel._store = self
         self._load()
 
     def _attach(self, domains):
@@ -250,7 +391,12 @@ class DomainStore:
         items = data.get("domains", []) if isinstance(data, dict) else data
         self._domains = self._attach([Domain.from_dict(d) for d in items
                                       if d.get("host")])
+        if isinstance(data, dict):
+            self.tunnel = TunnelState.from_dict(data.get("tunnel"))
+            self.tunnel._store = self
         self.log(f"载入 {len(self._domains)} 个域名配置")
+        if self.tunnel.enabled:
+            self.log(f"Tunnel 加速已启用（上次扫描 {len(self.tunnel.edges)} 个边缘）")
 
     def save(self):
         with self._lock:
@@ -258,6 +404,7 @@ class DomainStore:
                 "version": SCHEMA_VERSION,
                 "updated_at": int(time.time()),
                 "domains": [d.to_dict() for d in self._domains],
+                "tunnel": self.tunnel.to_dict(),
             }
             try:
                 os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)

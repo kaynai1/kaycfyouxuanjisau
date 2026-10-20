@@ -2,7 +2,26 @@
 
 ## 产物
 
-`cfopt.fpk`（约 44.8 KB）—— 标准 tar.gz 结构，与飞牛 `fnpack` 产物一致。
+`cfopt.fpk`（约 48 KB）—— 标准 tar.gz 结构，与飞牛 `fnpack` 产物一致。
+
+## 2.4.0 更新
+
+- 新增 **Cloudflare Tunnel 加速**：给跑在 NAS 上的 cloudflared 用的隧道边缘优选
+- 隧道连接器不走普通边缘，只连 `region1/region2.v2.argotunnel.com` 的
+  **7844** 端口（HTTP/2 + QUIC），对应专用段 `198.41.192.0/24`、`198.41.200.0/24`；
+  这两段不是 anycast，同段不同 IP 会落到不同机房（实测 LAX 与 SJC 混在同一 /24），
+  所以逐 IP 全量实测 508 个，不做抽样
+- 排序以 7844 端口TCP握手为准（隧道真正走的通道），再顺序复测 3 次取中位数；
+  机房只从 443 的 CF-RAY 读出来用于界面解释
+- region1 下发最快的 N 个、region2 下发次快的 N 个，保留备份边缘
+- 应用内独立 DNS 服务监听 `:15353`（`TUNNEL_DNS_LISTEN` 可改），
+  **不改 NAS 系统 DNS、不影响 hosts 模式**；SRV 等其它记录原样转发上游
+- 面板直接给出可粘贴的 `TUNNEL_DNS_RESOLVER_ADDRS=<NAS_IP>:15353`
+  Compose 片段和 `--dns-resolver-addrs` 命令参数
+- 安全性：隧道扫描失败或结果超过 3 天时自动退回上游解析，
+  最坏情况只是没有提速，不会出现隧道连不上
+- 说明范围：优化的是「边缘 → 本机 cloudflared」这一跳（决定隧道上传/下载速度）；
+  「访问者 → 边缘」那一跳由访问者自己的 DNS 决定，本机改不了
 
 ## 2.3.2 更新
 

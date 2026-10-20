@@ -70,10 +70,35 @@ class ApiError(Exception):
         self.status = status
 
 
+_local_ip_cache = None
+
+
+def _local_ip():
+    """本机对局域网可见的 IP，用来拼 cloudflared 的解析器地址。
+
+    不会真的发包：UDP connect 只是让内核选出默认路由的源地址。
+    拿不到就返回空，界面提示用户手动填 NAS IP。
+    """
+    global _local_ip_cache
+    if _local_ip_cache:
+        return _local_ip_cache
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("223.5.5.5", 53))
+        _local_ip_cache = s.getsockname()[0]
+    except Exception:
+        _local_ip_cache = ""
+    finally:
+        s.close()
+    return _local_ip_cache
+
+
 class Handler(BaseHTTPRequestHandler):
     store = None
     scanner = None
     cfg = None
+    tunnel_dns = None
     server_version = "cfopt/" + __version__
 
     def log_message(self, fmt, *args):
@@ -93,6 +118,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": True, "version": __version__})
             elif path == "/api/domains":
                 self._json({"domains": [d.snapshot() for d in self.store.list()]})
+            elif path == "/api/tunnel":
+                self._json(self._tunnel_json())
             elif path.startswith("/api/domains/"):
                 self._api_get_domain(path)
             else:
@@ -108,6 +135,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/api/domains":
                 self._api_add_domain()
+            elif path == "/api/tunnel/scan":
+                self._api_tunnel_scan()
             elif path.endswith("/scan") and path.startswith("/api/domains/"):
                 self._api_scan(path, parsed.query)
             else:
@@ -120,7 +149,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_PATCH(self):
         path = urlparse(self.path).path
         try:
-            if path.startswith("/api/domains/"):
+            if path == "/api/tunnel":
+                self._api_tunnel_patch()
+            elif path.startswith("/api/domains/"):
                 self._api_patch_domain(path)
             else:
                 raise ApiError("未知接口", 404)
@@ -290,6 +321,47 @@ class Handler(BaseHTTPRequestHandler):
                     "msg": "已触发全量扫描" if full else "已触发扫描"})
 
     # ------------------------------------------------------------ 响应
+    # ------------------------------------------------------------ Tunnel 加速
+    def _tunnel_json(self):
+        t = self.store.tunnel
+        snap = t.snapshot()
+        snap["dns_port"] = getattr(self.cfg, "tunnel_dns_port", 0)
+        snap["dns_ready"] = bool(self.tunnel_dns and self.tunnel_dns.ok)
+        snap["local_ip"] = _local_ip()
+        snap["running"] = self.scanner.is_running(self.scanner.TUNNEL_KEY)
+        snap["pins"] = {k: list(v) for k, v in t.pins().items()}
+        return {"ok": True, "tunnel": snap}
+
+    def _api_tunnel_patch(self):
+        t = self.store.tunnel
+        body = self._read_json()
+        fields = {}
+        if "enabled" in body:
+            fields["enabled"] = bool(body["enabled"])
+        for key, lo, hi in (("top_n", 1, 5), ("interval", 600, 604800)):
+            if key in body and body[key] is not None:
+                try:
+                    v = int(body[key])
+                except (TypeError, ValueError):
+                    raise ApiError(f"{key} 必须是数字")
+                if not lo <= v <= hi:
+                    raise ApiError(f"{key} 应在 {lo}-{hi} 之间")
+                fields[key] = v
+        t.update(**fields)
+        self.store.save()
+        # 刚开启又还没有结果时立刻扫一次，不用让用户等下一个周期
+        if (fields.get("enabled") and not t.edges
+                and not self.scanner.is_running(self.scanner.TUNNEL_KEY)):
+            self.scanner.trigger_tunnel()
+        self._json({"ok": True, "tunnel": t.snapshot()})
+
+    def _api_tunnel_scan(self):
+        if self.scanner.is_running(self.scanner.TUNNEL_KEY):
+            self._json({"ok": True, "msg": "扫描已在进行中"})
+            return
+        self.scanner.trigger_tunnel()
+        self._json({"ok": True, "msg": "已开始扫描隧道边缘"})
+
     def _json(self, obj, status=200):
         body = json.dumps(obj, ensure_ascii=False).encode()
         self.send_response(status)
@@ -337,6 +409,12 @@ class Handler(BaseHTTPRequestHandler):
             d["id"] + (":scan" if d.get("progress")
                        else (":done" if d["last_scan_at"] else ":queued"))
             for d in domains)
+        # 隧道扫描同样要自动刷新：它只有 20 秒左右，但用户盯着看
+        tt = self.store.tunnel
+        tunnel_scanning = bool(tt.progress)
+        tunnel_state = (("on" if tt.enabled else "off") + ":"
+                        + ("scan" if tt.progress else "idle") + ":"
+                        + str(len(tt.edges)))
 
         html = f"""<!doctype html><html lang=zh><head><meta charset=utf-8>
 <title>Cloudflare 优选管理</title>
@@ -395,6 +473,10 @@ display:inline-flex;align-items:center;gap:5px}}
 .badge.warn{{background:#fff6e8;color:#a15c07}}
 .badge.bad{{background:#fbe9e9;color:#b42318}}
 .badge.run{{background:#e8f0fd;color:#0a58ca}}
+.badge.idle{{background:#eceef1;color:#4b5563}}
+pre.cfg{{background:#1b1f24;color:#d6dde4;padding:12px 14px;border-radius:8px;
+overflow-x:auto;font-size:12px;line-height:1.55;margin:0 0 8px;
+font-family:ui-monospace,"SF Mono",Consolas,monospace}}
 .dot{{width:7px;height:7px;border-radius:50%;background:currentColor;
 display:inline-block}}
 .badge.run .dot{{animation:pulse 1s ease-in-out infinite}}
@@ -550,6 +632,8 @@ transition:width .4s ease}}
     避免出口线路把 HKG 绕远后仍被迫使用高延迟节点。</div>
 </div>
 
+<div id="tunnel">{self._tunnel_card()}</div>
+
 <div id="list">{cards}</div>
 
 <script>
@@ -654,6 +738,71 @@ document.getElementById("host").addEventListener("keydown", function (e) {{
   if (e.key === "Enter") addDomain();
 }});
 
+function saveTunnel() {{
+  fetch("/api/tunnel", {{
+    method: "PATCH",
+    headers: {{"Content-Type": "application/json"}},
+    body: JSON.stringify({{
+      top_n: parseInt(document.getElementById("ttop").value, 10),
+      interval: parseInt(document.getElementById("tiv").value, 10)
+    }})
+  }}).then(function (r) {{
+    return r.json().then(function (j) {{ return {{s: r.status, j: j}}; }});
+  }}).then(function (res) {{
+    if (res.s >= 400) alert(res.j.error || "保存失败"); else location.reload();
+  }}).catch(function (e) {{ alert("请求失败: " + e); }});
+}}
+
+function toggleTunnel(on) {{
+  fetch("/api/tunnel", {{
+    method: "PATCH",
+    headers: {{"Content-Type": "application/json"}},
+    body: JSON.stringify({{enabled: on}})
+  }}).then(function (r) {{
+    return r.json().then(function (j) {{ return {{s: r.status, j: j}}; }});
+  }}).then(function (res) {{
+    if (res.s >= 400) alert(res.j.error || "操作失败"); else location.reload();
+  }});
+}}
+
+function tunnelScan() {{
+  fetch("/api/tunnel/scan", {{method: "POST"}})
+    .then(function (r) {{ return r.json(); }})
+    .then(function () {{ location.reload(); }})
+    .catch(function (e) {{ alert("请求失败: " + e); }});
+}}
+
+function copyText(id) {{
+  var el = document.getElementById(id);
+  if (!el) return;
+  var ta = document.createElement("textarea");
+  ta.value = el.textContent;
+  document.body.appendChild(ta);
+  ta.select();
+  try {{ document.execCommand("copy"); }} catch (e) {{}}
+  document.body.removeChild(ta);
+}}
+
+// 隧道边缘扫描约 20 秒，扫完自动刷新一次，把结果和「已生效」显示出来
+(function () {{
+  if ({"true" if tunnel_scanning else "false"} !== true) return;
+  var last = {json.dumps(tunnel_state)};
+  function stateOf(j) {{
+    var t = j.tunnel;
+    return (t.enabled ? "on" : "off") + ":" + (t.progress ? "scan" : "idle")
+      + ":" + t.edges.length;
+  }}
+  function tick() {{
+    fetch("/api/tunnel").then(function (r) {{ return r.json(); }})
+      .then(function (j) {{
+        if (stateOf(j) !== last) location.reload();
+        else setTimeout(tick, 2000);
+      }})
+      .catch(function () {{ setTimeout(tick, 5000); }});
+  }}
+  setTimeout(tick, 2000);
+}})();
+
 // 扫描中自动刷新，让用户看到进度条和节点出现。
 // 用 fetch 局部刷新而不是整页 reload，避免闪烁和滚动位置丢失。
 (function () {{
@@ -691,6 +840,133 @@ document.getElementById("host").addEventListener("keydown", function (e) {{
 </script>
 </body></html>"""
         self._send_html(html)
+
+    # ------------------------------------------------------------ Tunnel 卡片
+    def _tunnel_card(self):
+        esc = html.escape
+        t = self.store.tunnel
+        snap = t.snapshot()
+        port = getattr(self.cfg, "tunnel_dns_port", 15353)
+        lip = _local_ip()
+        resolver = f"{lip or '<NAS_IP>'}:{port}"
+        pins = t.pins()
+        prog = snap.get("progress")
+        pinned_ips = {ip for ips in pins.values() for ip in ips}
+
+        if not t.enabled:
+            badge = '<span class="badge idle"><i class="dot"></i>未开启</span>'
+        elif prog:
+            badge = (f'<span class="badge run"><i class="dot"></i>'
+                     f'扫描中 {prog["pct"]}%</span>')
+        elif snap.get("stale"):
+            badge = '<span class="badge warn"><i class="dot"></i>已退回上游</span>'
+        elif pinned_ips:
+            badge = '<span class="badge ok"><i class="dot"></i>已生效</span>'
+        else:
+            badge = '<span class="badge warn"><i class="dot"></i>还没有结果</span>'
+
+        state = ""
+        if not t.enabled:
+            state = ("开启后，本应用会在 <b>:%d</b> 上单独给 cloudflared 做解析，"
+                     "不改动 NAS 的系统 DNS，也不影响域名优选的 hosts 下发。" % port)
+        elif snap.get("stale"):
+            state = (f"上次扫描已过 {int(t.MAX_AGE / 86400)} 天，为避免连接器一直用"
+                     "失效边缘，解析已交回上游 DNS。点“立即扫描”可恢复加速。")
+        elif pinned_ips:
+            r1 = ", ".join(pins.get("region1.v2.argotunnel.com", []))
+            r2 = ", ".join(pins.get("region2.v2.argotunnel.com", []))
+            state = (f"region1 → <code>{esc(r1)}</code>　"
+                     f"region2 → <code>{esc(r2)}</code><br>"
+                     "连接器只会连这些实测最快的隧道边缘；扫描失败时自动退回上游解析，"
+                     "不会让隧道连不上。")
+        else:
+            state = "正在等待首次扫描，通常 20 秒内完成。"
+
+        rows = []
+        for i, e in enumerate(t.edges[:10]):
+            pick = " class=pick" if e["ip"] in pinned_ips else ""
+            tag = ('<span class="tag">已下发</span>'
+                   if e["ip"] in pinned_ips else "")
+            rows.append(
+                f'<tr{pick}><td>{i + 1}</td><td>{esc(e["ip"])}</td>'
+                f'<td class="colo">{esc(e.get("colo") or "???")}</td>'
+                f'<td>{e["connect_ms"]:.0f} ms</td><td>{tag}</td></tr>')
+        table = ""
+        if rows:
+            table = f"""<div class="sect">
+  <div class="sect-t">隧道边缘实测
+    <span>端口 7844 · 存活 {t.total_alive} 个</span></div>
+  <table class="nodes">
+    <thead><tr><th>#</th><th>边缘 IP</th><th>机房</th><th>握手</th><th></th></tr></thead>
+    <tbody>{"".join(rows)}</tbody>
+  </table>
+</div>"""
+
+        docker_cfg = (
+            "services:\n"
+            "  cloudflared:\n"
+            "    image: cloudflare/cloudflared:latest\n"
+            "    restart: unless-stopped\n"
+            "    command: tunnel --no-autoupdate run\n"
+            "    environment:\n"
+            f"      - TUNNEL_DNS_RESOLVER_ADDRS={resolver}")
+        native_cfg = (f"cloudflared tunnel run "
+                      f"--dns-resolver-addrs {resolver} <TUNNEL_NAME>")
+
+        err = (f'<div class="err">{esc(t.last_error)}</div>'
+               if t.last_error and not t.edges else "")
+        dns_warn = ""
+        if self.tunnel_dns is not None and not self.tunnel_dns.ok:
+            dns_warn = (f'<div class="err">:{port} 绑定失败：'
+                        f'{esc(self.tunnel_dns.udp_error or "未知原因")}，'
+                        '可用环境变量 TUNNEL_DNS_LISTEN 换个端口。</div>')
+
+        top_sel = "".join(
+            f'<option value="{n}"{" selected" if t.top_n == n else ""}>'
+            f'{n} 个</option>' for n in (1, 2, 3))
+        iv_sel = "".join(
+            f'<option value="{v}"{" selected" if t.interval == v else ""}>'
+            f'{lbl}</option>'
+            for v, lbl in ((3600, "1 小时"), (21600, "6 小时"),
+                           (86400, "1 天"), (259200, "3 天")))
+
+        return f"""<div class="addbox" id="tunnelcard">
+  <h3>Cloudflare Tunnel 加速
+    <span style="float:right">{badge}</span></h3>
+  <div class="hint" style="margin-top:0;margin-bottom:12px">{state}</div>
+  {dns_warn}
+  <div class="row">
+    <div class="field">
+      <label>每个 region 下发边缘数</label>
+      <select id="ttop">{top_sel}</select>
+    </div>
+    <div class="field">
+      <label>重新扫描周期</label>
+      <select id="tiv">{iv_sel}</select>
+    </div>
+    <button onclick="saveTunnel()">保存</button>
+    <button class="ghost" onclick="tunnelScan()">立即扫描</button>
+    <button class="{'danger' if t.enabled else ''}"
+          onclick="toggleTunnel({'false' if t.enabled else 'true'})">
+      {'关闭加速' if t.enabled else '开启加速'}</button>
+  </div>
+  <div class="sect">
+    <div class="sect-t">接入方法 <span>给 cloudflared 指定解析器即可，无需改系统 DNS</span></div>
+    <div class="hint" style="margin:0 0 8px">
+      Docker / 飞牛容器：在 cloudflared 容器加下面这个环境变量
+      （原生服务用命令参数）。</div>
+    <pre class="cfg" id="cfgdocker">{esc(docker_cfg)}</pre>
+    <pre class="cfg">{esc(native_cfg)}</pre>
+    <button class="ghost sm" onclick="copyText('cfgdocker')">复制 Compose 片段</button>
+  </div>
+  {table}
+  <div class="hint">
+    隧道有两跳：<b>访问者 → Cloudflare 边缘</b> 和 <b>边缘 → 本机 cloudflared</b>。
+    这里优化的是后者（占隧道带宽瓶颈的大头，直接决定上传/下载速度）；
+    前者由访问者自己的 DNS 决定，本机改不了。
+    段内 IP 不共享 anycast，同一段也会落到不同机房，所以逐 IP 全量实测 7844 端口。</div>
+  {err}
+</div>"""
 
     # ------------------------------------------------------------ 域名卡片
     def _domain_card(self, d):
@@ -875,7 +1151,8 @@ document.getElementById("host").addEventListener("keydown", function (e) {{
     def _page_status(self):
         domains = [d.snapshot() for d in self.store.list()]
         payload = {"version": __version__, "mode": self.cfg.mode,
-                   "domains": domains}
+                   "domains": domains,
+                   "tunnel": self._tunnel_json()["tunnel"]}
         if "application/json" in (self.headers.get("Accept") or ""):
             self._json(payload)
             return
@@ -898,8 +1175,9 @@ overflow-x:auto;font-size:12.5px;line-height:1.6;margin-top:16px}}
         self._send_html(html)
 
 
-def serve(cfg, store, scanner):
+def serve(cfg, store, scanner, tunnel_dns=None):
     Handler.cfg = cfg
     Handler.store = store
     Handler.scanner = scanner
+    Handler.tunnel_dns = tunnel_dns
     return ThreadingHTTPServer(("0.0.0.0", cfg.http_port), Handler)

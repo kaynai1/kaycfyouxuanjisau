@@ -45,6 +45,15 @@ V2TOO_API = "https://ip.v2too.top/api/nodes?carrier={}"
 _v2too_cache = {"at": 0.0, "ips": []}
 _v2too_lock = threading.Lock()
 
+# ---------------------------------------------------------------- Cloudflare Tunnel
+# cloudflared（隧道连接器）不走普通边缘段，而是连隧道专用段。
+# 这两段是隧道协议（7844）唯一开放的地方，普通优选 IP 连不上 7844。
+TUNNEL_V4 = ["198.41.192.0/24", "198.41.200.0/24"]
+TUNNEL_PORT = 7844
+# 连接器按 SRV _v2-origintunneld._tcp.argotunnel.com 拿到这两个域名，
+# 再解析 A 记录。只要接管这两条 A 记录，就能把连接器钉到实测最快的边缘。
+TUNNEL_REGIONS = ["region1.v2.argotunnel.com", "region2.v2.argotunnel.com"]
+
 
 def is_cloudflare_ip(ip):
     """判断 IP 是否属于 Cloudflare 网段。"""
@@ -302,6 +311,76 @@ def nets_from_results(results, colo, limit=0):
     ordered = sorted(buckets.items(), key=lambda kv: min(kv[1]))
     nets = [n for n, _ in ordered]
     return nets[:limit] if limit else nets
+
+
+def tunnel_candidates():
+    """隧道边缘全部候选 IP（两段各 254 个，逐 IP 而不是抽样）。
+
+    普通扫描按 /24 抽样是因为同段 anycast 落地一致；隧道段不是 anycast，
+    同段不同 IP 分到不同机房（实测 LAX 与 SJC 混在同一 /24 里），
+    必须全量测。
+    """
+    out = []
+    for cidr in TUNNEL_V4:
+        out.extend(str(h) for h in ipaddress.ip_network(cidr, strict=False).hosts())
+    return out
+
+
+def _probe_tunnel_ip(ip, timeout):
+    """连接器实际用的端口是 7844，普通 443 的延迟不代表这条路径。"""
+    return tcp_connect_ms(ip, TUNNEL_PORT, timeout)
+
+
+def scan_tunnel_edges(workers=64, timeout=2.5, progress=None,
+                      refine_head=15, colo_count=12):
+    """扫描隧道边缘，返回 (最优列表, 存活总数)。
+
+    步骤：并发粗测 7844 → 前 N 个顺序复测取中位数（并发读数会被线程调度
+    放大）→ 对最靠前的若干个再测 443 以识别机房（CF-RAY）。机房只是给
+    界面解释用，排序始终以 7844 实测延迟为准。
+    """
+    ips = tunnel_candidates()
+    total = len(ips)
+    alive = []
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = {pool.submit(_probe_tunnel_ip, ip, timeout): ip for ip in ips}
+        for fut in as_completed(futs):
+            done += 1
+            ms = fut.result()
+            if ms is not None:
+                alive.append({"ip": futs[fut], "connect_ms": ms, "colo": "???"})
+            if progress and (done % 50 == 0 or done == total):
+                progress(done, total, len(alive))
+
+    if not alive:
+        return [], 0
+
+    alive.sort(key=lambda r: r["connect_ms"])
+    head = alive[:refine_head]
+    for r in head:
+        samples = [ms for ms in
+                   (_probe_tunnel_ip(r["ip"], max(timeout, 2.0))
+                    for _ in range(3)) if ms is not None]
+        if not samples:
+            # 复测三连失败说明刚才的读数是抖动，直接剔除，
+            # 否则会把一个连不上的边缘下发给连接器。
+            r["connect_ms"] = None
+            continue
+        r["connect_ms"] = round(_median(samples), 1)
+    head = [r for r in head if r["connect_ms"] is not None]
+    head.sort(key=lambda r: r["connect_ms"])
+
+    def fill_colo(r):
+        p = probe_once(r["ip"], "www.cloudflare.com", 443, max(timeout, 3.0))
+        r["colo"] = (p or {}).get("colo") or "???"
+        return r
+
+    for grp in (head[:colo_count],):
+        with ThreadPoolExecutor(max_workers=min(8, len(grp) or 1)) as pool:
+            list(pool.map(fill_colo, grp))
+
+    return head, len(alive)
 
 
 def download_speed(ip, host, path, timeout=10.0, max_bytes=8 * 1024 * 1024):
